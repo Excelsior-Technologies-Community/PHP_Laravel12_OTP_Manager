@@ -12,6 +12,15 @@ class Otp extends Model
         'type',
         'tracking_code',
         'attempts',
+        'is_verified',
+        'status',
+        'blocked_until',
         'expires_at'
+    ];
+
+    protected $casts = [
+        'expires_at' => 'datetime',
+        'blocked_until' => 'datetime',
+        'is_verified' => 'boolean',
     ];
 }
