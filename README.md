@@ -825,10 +825,3 @@ PHP_Laravel12_OTP_Manager/
 ---
 
 Your PHP_Laravel12_OTP_Manager Project is now ready!
-
-
-
-<<<<<<< HEAD
-
-=======
->>>>>>> development
