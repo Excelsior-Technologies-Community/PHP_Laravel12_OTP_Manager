@@ -3,123 +3,121 @@
 namespace App\Services;
 
 use App\Models\Otp;
-use Illuminate\Support\Str;
+use App\Models\OtpSecurityLog;
 use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Str;
 
 class OtpService
 {
-    /**
-     * Send OTP
-     */
-    public function send($mobile, $type = null)
+    public function __construct(
+        private DeviceFingerprintService $fingerprint,
+        private GeoFenceService $geo
+    ) {}
+
+    public function send(string $mobile, ?string $type = null, ?Request $request = null): Otp
     {
-        // Cooldown check
         if (cache()->has('otp_cooldown_' . $mobile)) {
-            throw new \Exception("Please wait before requesting OTP again");
+            throw new \Exception('Please wait before requesting OTP again');
         }
 
-        // Generate OTP
-        $code = rand(
-            config('otp.code_min'),
-            config('otp.code_max')
-        );
+        $deviceInfo = $request ? $this->fingerprint->extract($request) : [];
+        $geoInfo    = $request ? $this->geo->lookup($request->ip()) : [];
 
-        // Create OTP
+        $code = rand(config('otp.code_min'), config('otp.code_max'));
+
         $otp = Otp::create([
-            'mobile' => $mobile,
-            'code' => $code,
-            'type' => $type,
+            'mobile'        => $mobile,
+            'code'          => $code,
+            'type'          => $type,
             'tracking_code' => (string) Str::uuid(),
-            'expires_at' => Carbon::now()->addMinutes(config('otp.expiry')),
-            'status' => 'pending',
+            'expires_at'    => Carbon::now()->addMinutes(config('otp.expiry')),
+            'status'        => 'pending',
+            'ip_address'    => $deviceInfo['ip_address'] ?? null,
+            'user_agent'    => $deviceInfo['user_agent'] ?? null,
+            'fingerprint'   => $deviceInfo['fingerprint'] ?? null,
+            'country'       => $geoInfo['country'] ?? null,
+            'city'          => $geoInfo['city'] ?? null,
         ]);
 
-        // Store cooldown
-        cache()->put(
-            'otp_cooldown_' . $mobile,
-            true,
-            config('otp.cooldown')
-        );
+        cache()->put('otp_cooldown_' . $mobile, true, config('otp.cooldown'));
 
-        // Trigger event
+        // Security log
+        OtpSecurityLog::create([
+            'mobile'     => $mobile,
+            'ip_address' => $deviceInfo['ip_address'] ?? 'unknown',
+            'user_agent' => $deviceInfo['user_agent'] ?? null,
+            'fingerprint'=> $deviceInfo['fingerprint'] ?? null,
+            'country'    => $geoInfo['country'] ?? null,
+            'city'       => $geoInfo['city'] ?? null,
+            'region'     => $geoInfo['region'] ?? null,
+            'latitude'   => $geoInfo['latitude'] ?? null,
+            'longitude'  => $geoInfo['longitude'] ?? null,
+            'event_type' => 'send_otp',
+            'status'     => 'success',
+            'meta'       => json_encode(['tracking_code' => $otp->tracking_code]),
+        ]);
+
         event(new \App\Events\OtpPrepared($otp));
 
         return $otp;
     }
 
-    /**
-     * Verify OTP
-     */
-    public function verify($mobile, $code, $trackingCode)
+    public function verify(string $mobile, string $code, string $trackingCode, ?Request $request = null): array
     {
+        $deviceInfo = $request ? $this->fingerprint->extract($request) : [];
+        $ip         = $deviceInfo['ip_address'] ?? 'unknown';
+        $fp         = $deviceInfo['fingerprint'] ?? null;
+
         $otp = Otp::where('mobile', $mobile)
             ->where('tracking_code', $trackingCode)
             ->latest()
             ->first();
 
-        // OTP not found
         if (!$otp) {
-            return [
-                'status' => false,
-                'message' => 'OTP not found'
-            ];
+            $this->securityLog($mobile, $ip, $fp, $deviceInfo, 'verify_otp', 'failed', 'OTP not found');
+            return ['status' => false, 'message' => 'OTP not found'];
         }
 
-        // Block check
         if ($otp->blocked_until && now()->lt($otp->blocked_until)) {
-            return [
-                'status' => false,
-                'message' => 'Too many attempts. Try again later.'
-            ];
+            $this->securityLog($mobile, $ip, $fp, $deviceInfo, 'verify_otp', 'blocked', 'Blocked until ' . $otp->blocked_until);
+            return ['status' => false, 'message' => 'Too many attempts. Try again later.'];
         }
 
-        // Expiry check
         if ($otp->expires_at < now()) {
-
-            $otp->update([
-                'status' => 'expired'
-            ]);
-
-            return [
-                'status' => false,
-                'message' => 'OTP expired'
-            ];
+            $otp->update(['status' => 'expired']);
+            $this->securityLog($mobile, $ip, $fp, $deviceInfo, 'verify_otp', 'failed', 'OTP expired');
+            return ['status' => false, 'message' => 'OTP expired'];
         }
 
-        // Attempt limit check
         if ($otp->attempts >= config('otp.max_attempts')) {
-
-            $otp->update([
-                'status' => 'failed',
-                'blocked_until' => now()->addMinutes(5)
-            ]);
-
-            return [
-                'status' => false,
-                'message' => 'Maximum attempts reached'
-            ];
+            $otp->update(['status' => 'failed', 'blocked_until' => now()->addMinutes(5)]);
+            $this->securityLog($mobile, $ip, $fp, $deviceInfo, 'verify_otp', 'blocked', 'Max attempts reached');
+            return ['status' => false, 'message' => 'Maximum attempts reached'];
         }
 
-        // Invalid OTP
         if ($otp->code != $code) {
-
             $otp->increment('attempts');
-
-            return [
-                'status' => false,
-                'message' => 'Invalid OTP'
-            ];
+            $this->securityLog($mobile, $ip, $fp, $deviceInfo, 'verify_otp', 'failed', 'Invalid OTP code');
+            return ['status' => false, 'message' => 'Invalid OTP'];
         }
 
-        // Success
-        $otp->update([
-            'is_verified' => true,
-            'status' => 'verified'
-        ]);
+        $otp->update(['is_verified' => true, 'status' => 'verified']);
+        $this->securityLog($mobile, $ip, $fp, $deviceInfo, 'verify_otp', 'success', 'OTP verified');
 
-        return [
-            'status' => true,
-            'message' => 'OTP verified successfully'
-        ];
+        return ['status' => true, 'message' => 'OTP verified successfully'];
+    }
+
+    private function securityLog(string $mobile, string $ip, ?string $fp, array $device, string $event, string $status, string $reason): void
+    {
+        OtpSecurityLog::create([
+            'mobile'     => $mobile,
+            'ip_address' => $ip,
+            'user_agent' => $device['user_agent'] ?? null,
+            'fingerprint'=> $fp,
+            'event_type' => $event,
+            'status'     => $status,
+            'meta'       => json_encode(['reason' => $reason]),
+        ]);
     }
 }
